@@ -267,7 +267,7 @@ logger = logging.getLogger("credit-score-api")
 # --- 1. Configuration ---
 SRC_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SRC_DIR
-ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
+ARTIFACTS_DIR = Path('./artifacts/')
 TARGET_TIME_PER_REQUEST = 1.0  # Like the original API, throttle requests
 
 # Public node URLs for direct connection
