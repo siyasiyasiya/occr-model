@@ -248,21 +248,27 @@ import numpy as np
 import joblib
 from pathlib import Path
 import json
+import time
 from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Query
 import asyncio
-import time
+import logging
 
 # --- Import XRPL Libraries ---
 from xrpl.asyncio.clients import AsyncJsonRpcClient
-from xrpl.models.requests import AccountInfo, AccountTx, AccountLines, LedgerEntry
+from xrpl.models.requests import AccountInfo, AccountTx, AccountLines, LedgerCurrent
 from xrpl.models.response import Response
-from xrpl.utils import datetime_to_ripple_time, ripple_time_to_datetime
+from xrpl.utils import ripple_time_to_datetime
 
-# --- 1. Robust Path and Configuration Setup ---
+# --- Configure Logging ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("credit-score-api")
+
+# --- 1. Configuration ---
 SRC_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SRC_DIR.parent
+PROJECT_ROOT = SRC_DIR
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
+TARGET_TIME_PER_REQUEST = 1.0  # Like the original API, throttle requests
 
 # Public node URLs for direct connection
 XRPL_NODE_URLS = {
@@ -280,7 +286,7 @@ try:
     pca = joblib.load(ARTIFACTS_DIR / 'pca.joblib')
     cluster_risk_mapping = joblib.load(ARTIFACTS_DIR / 'cluster_risk_mapping.joblib')
     pca_params = joblib.load(ARTIFACTS_DIR / 'pca_scaling_params.joblib')
-    with open(PROJECT_ROOT / "all_tokens.json", 'r') as f:
+    with open("all_tokens.json", 'r') as f:
         tokens_data = json.load(f)
     token_df = pd.DataFrame(tokens_data)
     print("...artifacts loaded successfully.")
@@ -296,125 +302,265 @@ app = FastAPI(
 )
 
 # --- 3. Helper Functions ---
-async def fetch_account_inception(client, address):
-    """Fetches the account creation time by examining ledger entry"""
-    try:
-        ledger_request = LedgerEntry(
-            ledger_index="validated",
-            account_root=address
-        )
-        response = await client.request(ledger_request)
-        if response.is_successful():
-            # The 'index' field can be used to determine the first ledger this account appeared in
-            # This is a simplification - a more accurate approach would be to use account_tx with
-            # a binary search to find the first transaction for this account
-            first_ledger = response.result.get("ledger_current_index", 0)
-            # Estimate time based on ledger (rough approximation)
-            ripple_epoch_time = int(time.time() - (first_ledger * 4))  # Approx 4 seconds per ledger
-            return ripple_time_to_datetime(ripple_epoch_time).isoformat()
-    except Exception as e:
-        print(f"Error fetching account inception: {e}")
-    
-    # Fallback: if we can't determine inception, use the date of the oldest transaction
-    return None
 
-async def fetch_account_assets(client, address):
-    """Fetches all assets (tokens) held by the account"""
+async def _api_request(client, request_fn, *args, **kwargs):
+    """
+    Throttled API request function to mimic the original behavior
+    """
+    start_time = time.time()
+    try:
+        result = await request_fn(*args, **kwargs)
+        return result
+    except Exception as e:
+        logger.error(f"API request error: {e}")
+        return None
+    finally:
+        # Throttle like the original implementation
+        duration = time.time() - start_time
+        wait_time = TARGET_TIME_PER_REQUEST - duration
+        if wait_time > 0:
+            await asyncio.sleep(wait_time)
+
+async def get_account_first_transaction(client, address):
+    """
+    Determine when the account was created by finding the first transaction
+    """
+    try:
+        # Get current ledger index
+        ledger_request = LedgerCurrent()
+        ledger_response = await client.request(ledger_request)
+        if not ledger_response.is_successful():
+            return None
+            
+        current_ledger = ledger_response.result.get("ledger_current_index", 0)
+        
+        # Start from earliest ledger and look for transactions
+        first_tx = None
+        marker = None
+        
+        # First, try with a big limit to get the oldest transactions
+        tx_request = AccountTx(
+            account=address, 
+            ledger_index_min=1,  # Start from the beginning
+            ledger_index_max=current_ledger,
+            limit=200,  # Get a large batch to minimize requests
+            forward=True  # Get oldest first
+        )
+        
+        tx_response = await client.request(tx_request)
+        if tx_response.is_successful() and tx_response.result.get("transactions"):
+            transactions = tx_response.result["transactions"]
+            # Get the oldest transaction
+            if transactions:
+                first_tx = transactions[0]
+                
+        if first_tx and "tx" in first_tx and "date" in first_tx["tx"]:
+            tx_date = ripple_time_to_datetime(first_tx["tx"]["date"])
+            return tx_date.isoformat()
+            
+        return None
+    except Exception as e:
+        logger.error(f"Error finding first transaction: {e}")
+        return None
+
+async def get_assets_with_verification(client, address):
+    """
+    Get account assets with verification status (estimated)
+    """
     assets = []
     try:
         lines_request = AccountLines(account=address)
-        lines_response = await client.request(lines_request)
+        lines_response = await _api_request(client, client.request, lines_request)
         
-        if lines_response.is_successful():
+        if lines_response and lines_response.is_successful():
             for line in lines_response.result.get("lines", []):
+                issuer = line.get("account")
+                currency = line.get("currency")
+                
+                # Try to match with token database for verification status
+                is_verified = False
+                if token_df is not None:
+                    token_match = token_df[(token_df['issuer'] == issuer) & 
+                                           (token_df['currency'] == currency)]
+                    if not token_match.empty:
+                        # If we have a match in our token database, consider it verified
+                        is_verified = True
+                
                 asset = {
-                    "currency": line.get("currency"),
-                    "counterparty": line.get("account"),
+                    "currency": currency,
+                    "counterparty": issuer,
                     "value": line.get("balance"),
-                    "counterpartyName": {"verified": False}  # Default to unverified
+                    "counterpartyName": {
+                        "verified": is_verified,
+                        "name": "Unknown"  # We don't have this data
+                    }
                 }
                 assets.append(asset)
+                
+            # Check for additional pages (marker)
+            marker = lines_response.result.get("marker")
+            while marker:
+                lines_request = AccountLines(
+                    account=address,
+                    marker=marker
+                )
+                lines_response = await _api_request(client, client.request, lines_request)
+                if not (lines_response and lines_response.is_successful()):
+                    break
+                    
+                for line in lines_response.result.get("lines", []):
+                    issuer = line.get("account")
+                    currency = line.get("currency")
+                    
+                    # Check verification status
+                    is_verified = False
+                    if token_df is not None:
+                        token_match = token_df[(token_df['issuer'] == issuer) & 
+                                              (token_df['currency'] == currency)]
+                        if not token_match.empty:
+                            is_verified = True
+                    
+                    asset = {
+                        "currency": currency,
+                        "counterparty": issuer,
+                        "value": line.get("balance"),
+                        "counterpartyName": {
+                            "verified": is_verified,
+                            "name": "Unknown"
+                        }
+                    }
+                    assets.append(asset)
+                
+                marker = lines_response.result.get("marker")
+                
     except Exception as e:
-        print(f"Error fetching account assets: {e}")
+        logger.error(f"Error fetching account assets: {e}")
     
     return assets
 
+async def get_all_transactions_paginated(client, address):
+    """
+    Get all transactions using pagination, just like the original XRPScan API implementation
+    """
+    all_transactions = []
+    marker = None
+    
+    # Similar to the original code, limit to 15 pagination calls
+    for _ in range(15):
+        try:
+            if marker:
+                tx_request = AccountTx(account=address, limit=25, marker=marker)
+            else:
+                tx_request = AccountTx(account=address, limit=25)
+                
+            tx_response = await _api_request(client, client.request, tx_request)
+            
+            if not (tx_response and tx_response.is_successful()):
+                break
+                
+            txs = tx_response.result.get("transactions", [])
+            if not txs:
+                break
+                
+            # Format transactions to match XRPScan structure
+            for tx_entry in txs:
+                tx = tx_entry.get("tx", {})
+                # Add meta data which contains transaction result
+                tx["meta"] = tx_entry.get("meta", {})
+                
+                if "date" in tx:
+                    # Convert Ripple epoch time to ISO format datetime
+                    tx_date = ripple_time_to_datetime(tx["date"])
+                    tx["date"] = tx_date.isoformat()
+                    
+                all_transactions.append(tx)
+            
+            # Check for more pages
+            marker = tx_response.result.get("marker")
+            if not marker:
+                break
+                
+        except Exception as e:
+            logger.error(f"Error in transaction pagination: {e}")
+            break
+            
+    return all_transactions
+
+async def get_account_initial_balance(client, address, first_tx_date=None):
+    """
+    Estimate initial balance - try to find earliest transactions that funded the account
+    """
+    try:
+        # Default to 10 XRP (base reserve)
+        initial_balance = 10.0
+        
+        # If we know the first transaction date, we can try to find funding transactions
+        if first_tx_date:
+            # This is a simplification - in reality this would require more complex analysis
+            # of the earliest transactions
+            pass
+            
+        return str(initial_balance)
+    except Exception as e:
+        logger.error(f"Error estimating initial balance: {e}")
+        return "10"  # Default to base reserve
+
 async def get_live_data_for_address(address: str, network: str):
     """
-    Fetches live data directly from an XRPL node using xrpl-py.
-    Formatted to match the structure expected by the feature generator.
+    Fetches live data directly from an XRPL node, formatted to match XRPScan API structure
     """
     node_url = XRPL_NODE_URLS.get(network)
     if not node_url:
         raise ValueError(f"Invalid network specified: {network}")
         
-    print(f"\n Collecting live data for {address} from {network}...")
+    logger.info(f"\n Collecting live data for {address} from {network}...")
     client = AsyncJsonRpcClient(node_url)
     
-    # Run requests in parallel for speed
+    # Get basic account info
     acc_info_request = AccountInfo(account=address, ledger_index="validated")
-    acc_tx_request = AccountTx(account=address, limit=400)  # Fetch a large batch of recent transactions
+    acc_info_response = await _api_request(client, client.request, acc_info_request)
 
-    acc_info_response, acc_tx_response = await asyncio.gather(
-        client.request(acc_info_request),
-        client.request(acc_tx_request)
-    )
-
-    if not acc_info_response.is_successful():
+    if not (acc_info_response and acc_info_response.is_successful()):
         raise ValueError(f"Could not fetch account info for {address}. The account may not be activated on {network}.")
     
     account_data = acc_info_response.result["account_data"]
     
-    # Fetch assets held by the account
-    assets = await fetch_account_assets(client, address)
+    # Get account inception (first transaction date)
+    inception_date = await get_account_first_transaction(client, address)
     
-    # Reformat transaction data to match the structure your feature generator expects
-    transactions_formatted = []
-    tx_dates = []
+    # Get all transactions with pagination (like original code)
+    transactions = await get_all_transactions_paginated(client, address)
     
-    if acc_tx_response.is_successful():
-        for tx_entry in acc_tx_response.result.get("transactions", []):
-            tx = tx_entry.get("tx", {})
-            # Add meta data which contains transaction result
-            tx["meta"] = tx_entry.get("meta", {})
-            
-            if "date" in tx:
-                # Convert Ripple epoch time to ISO format datetime
-                tx_date = ripple_time_to_datetime(tx["date"])
-                tx["date"] = tx_date.isoformat()
-                tx_dates.append(tx_date)
-                
-            transactions_formatted.append(tx)
+    # Estimate initial balance
+    initial_balance = await get_account_initial_balance(client, address, inception_date)
     
-    # Get account inception date (or earliest transaction if not available)
-    inception_date = await fetch_account_inception(client, address)
-    if not inception_date and tx_dates:
-        # Use earliest transaction as fallback
-        inception_date = min(tx_dates).isoformat()
+    # Get assets with verification status
+    assets = await get_assets_with_verification(client, address)
     
-    # Calculate initial balance (approximation based on current reserves)
-    reserve_base = 10  # XRP reserve base on XRPL (10 XRP for activation)
-    
-    # Reformat account info to match original structure
+    # Format account info to match XRPScan API structure
     account_info_formatted = {
         "account": account_data["Account"],
         "xrpBalance": str(float(account_data["Balance"]) / 1_000_000),  # Convert drops to XRP
         "inception": inception_date,
-        "initial_balance": str(reserve_base)  # Use base reserve as approximation
+        "initial_balance": initial_balance
     }
+
+    # Log data structure for debugging
+    logger.info(f"Account data retrieved for {address}: Balance={account_info_formatted['xrpBalance']} XRP, " +
+               f"Transactions={len(transactions)}, Assets={len(assets)}")
 
     return {
         "account_info": account_info_formatted,
-        "transactions": transactions_formatted,
+        "transactions": transactions,
         "assets": assets
     }
 
 def generate_features_from_live_data(live_data: dict, token_df: pd.DataFrame):
     """
     Takes live data and generates only the specific features needed by the model.
-    This is a streamlined version of your feature engineering script.
+    This is almost identical to the original function.
     """
-    print("\n Generating required features from live data...")
+    logger.info("\n Generating required features from live data...")
     account_info = live_data.get('account_info', {})
     transactions = live_data.get('transactions', [])
     assets = live_data.get('assets', [])
@@ -434,9 +580,11 @@ def generate_features_from_live_data(live_data: dict, token_df: pd.DataFrame):
             features['account_age_days'] = (current_time - inception_time).days
         except (ValueError, TypeError):
             # Fallback if date parsing fails
-            features['account_age_days'] = 1
+            logger.warning(f"Could not parse inception date: {inception_str}. Using default account age.")
+            features['account_age_days'] = 30  # Default value
     else:
-        features['account_age_days'] = 1
+        logger.warning("No inception date found. Using default account age.")
+        features['account_age_days'] = 30  # Default value
 
     features['xrp_balance'] = float(account_info.get('xrpBalance', 0))
     features['initial_balance'] = float(account_info.get('initial_balance', 0))
@@ -465,7 +613,14 @@ def generate_features_from_live_data(live_data: dict, token_df: pd.DataFrame):
             except (ValueError, TypeError):
                 continue
     
-    features['days_since_last_transaction'] = (current_time - max(tx_dates)).days if tx_dates else 999
+    if tx_dates:
+        features['days_since_last_transaction'] = (current_time - max(tx_dates)).days
+        # This also implies the account is at least as old as its first transaction
+        if features['account_age_days'] is None: # This check may be redundant but is safe
+            features['account_age_days'] = (current_time - min(tx_dates)).days
+    else:
+        # If there are no transactions, the last transaction was effectively at creation
+        features['days_since_last_transaction'] = features.get('account_age_days', 999)
     features['transaction_frequency_per_day'] = total_txns / max(features['account_age_days'], 1)
     
     recent_txns = [tx for tx in tx_dates if (current_time - tx).days <= 30]
@@ -534,7 +689,13 @@ def generate_features_from_live_data(live_data: dict, token_df: pd.DataFrame):
         
     features['operational_risk_score'] = 1 - features['transaction_success_rate']
 
-    print("...features generated.")
+    # Log feature statistics for debugging
+    logger.info("Feature generation complete. Key features:")
+    logger.info(f"  Account age: {features['account_age_days']} days")
+    logger.info(f"  XRP balance: {features['xrp_balance']} XRP")
+    logger.info(f"  Transaction count: {features['total_transaction_count']}")
+    logger.info(f"  Asset count: {features['total_assets_held']}")
+    
     return pd.DataFrame([features])
 
 
@@ -548,9 +709,12 @@ async def get_credit_score(
     Takes an XRPL account address and returns its risk score and label.
     This endpoint orchestrates the entire prediction process.
     """
-    print(f"Received scoring request for address: {address} on {network}")
+    logger.info(f"Received scoring request for address: {address} on {network}")
     try:
+        # Get live data with proper structure
         live_data = await get_live_data_for_address(address, network)
+        
+        # Generate features
         features_df = generate_features_from_live_data(live_data, token_df)
         
         # Ensure all required features are present
@@ -559,11 +723,10 @@ async def get_credit_score(
                 features_df[col] = 0
         features_df = features_df[feature_cols]
         
+        # Apply model pipeline
         scaled_features = scaler.transform(features_df.values)
-        
         is_outlier = iso_forest.predict(scaled_features)[0]
         cluster_id = -1 if is_outlier == -1 else gmm.predict(scaled_features)[0]
-        
         pca_score = pca.transform(scaled_features)[0, 0]
         
         if pca_params['needs_flipping']:
@@ -573,6 +736,9 @@ async def get_credit_score(
         final_score = np.clip(final_score, 0, 100)
         
         risk_label = cluster_risk_mapping.get(cluster_id, "Unknown")
+        
+        # Log the final score
+        logger.info(f"Credit score for {address}: {round(final_score, 2)} ({risk_label})")
         
         return {
             "address": address,
@@ -584,7 +750,7 @@ async def get_credit_score(
         }
 
     except Exception as e:
-        print(f"❌ Error processing request for {address}: {e}")
+        logger.error(f"❌ Error processing request for {address}: {e}")
         raise HTTPException(status_code=500, detail=f"An error occurred while scoring the address: {str(e)}")
 
 # --- 5. A Root Endpoint for Health Checks ---
