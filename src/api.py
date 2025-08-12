@@ -11,7 +11,7 @@ from datetime import datetime
 from fastapi import FastAPI, HTTPException
 
 # --- Configuration ---
-ARTIFACTS_DIR = Path('../artifacts/')
+ARTIFACTS_DIR = Path('./artifacts/')
 API_BASE_URL = "https://api.xrpscan.com/api/v1"
 TARGET_TIME_PER_REQUEST = 1.0
 
@@ -26,7 +26,7 @@ try:
     pca = joblib.load(ARTIFACTS_DIR / 'pca.joblib')
     cluster_risk_mapping = joblib.load(ARTIFACTS_DIR / 'cluster_risk_mapping.joblib')
     pca_params = joblib.load(ARTIFACTS_DIR / 'pca_scaling_params.joblib')
-    with open("../all_tokens.json", 'r') as f:
+    with open("./all_tokens.json", 'r') as f:
         tokens_data = json.load(f)
     token_df = pd.DataFrame(tokens_data)
     print("...artifacts loaded successfully.")
