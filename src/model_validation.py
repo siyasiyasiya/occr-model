@@ -17,7 +17,7 @@ INPUT_PROFILES = '../output/results/risk_profiles.csv'
 RAW_DATA_FILE = '../output/complete_features.csv'
 OUTPUT_DIR = Path('../output/validation/')
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
-N_COMPONENTS = 5 # This MUST match the n_components from your main script
+N_COMPONENTS = 5
 
 def validate_gmm_model():
     """Comprehensive validation of the GMM-based risk model with corrected metrics"""
@@ -50,10 +50,6 @@ def validate_gmm_model():
     
     # 6. Generate Summary Report
     generate_summary_report(is_monotonic, valid_indicators, score_category_corr, avg_confidence, bic)
-
-# NOTE: The individual validation functions from your script are excellent.
-# The main changes are in `validate_model_consistency` (replacing Silhouette)
-# and `generate_summary_report` (the final judgment logic).
 
 def validate_risk_distribution(df):
     """Validate the distribution of accounts across risk categories"""
@@ -103,7 +99,6 @@ def validate_feature_correlations(df):
             actual = 'positive' if correlations[indicator] > 0 else 'negative'
             match = actual == expected
             if not match:
-                # We relax the check for high_risk_asset_ratio as we know it's not a primary driver
                 if indicator != 'high_risk_asset_ratio':
                     valid_indicators = False
             print(f"  {indicator:<30}: Expected {expected:<8}, Actual {actual:<8}, Match: {'Yes' if match else 'No'}")
@@ -114,7 +109,6 @@ def validate_gmm_quality(df):
     print("\n[4/5] Validating GMM Clustering Quality...")
     try:
         raw_df = pd.read_csv(RAW_DATA_FILE)
-        # --- Replicate Feature Selection from main script ---
         all_feature_cols = ['account_age_days', 'xrp_balance', 'balance_to_initial_ratio', 'total_portfolio_value', 'initial_balance','total_transaction_count', 'transaction_success_rate', 'days_since_last_transaction', 'transaction_frequency_per_day','recent_activity_ratio', 'failed_transaction_count', 'payment_transaction_ratio', 'recent_failure_count','counterparty_diversity_ratio', 'avg_outgoing_amount', 'total_asset_value', 'asset_weighted_avg_token_score','high_risk_asset_ratio', 'verified_assets_ratio', 'total_assets_held', 'asset_avg_token_score','portfolio_concentration_index', 'token_quality_diversification', 'xrp_portfolio_ratio', 'dormancy_score','liquidity_risk_score', 'activity_consistency', 'operational_risk_score']
         available_features = [col for col in all_feature_cols if col in raw_df.columns]
         X_all = raw_df[available_features]
@@ -138,7 +132,7 @@ def validate_gmm_quality(df):
         clusters = df.loc[core_indices, 'risk_cluster'].astype(int)
         
         # Re-fit the GMM to get the scores
-        gmm = GaussianMixture(n_components=N_COMPONENTS, covariance_type='full', random_state=42)
+        gmm = GaussianMixture(n_components=N_COMPONENTS, covariance_type='full', n_init=5, random_state=42)
         gmm.fit(X_scaled_core)
 
         bic = gmm.bic(X_scaled_core)

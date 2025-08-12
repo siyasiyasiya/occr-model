@@ -81,7 +81,7 @@ def main():
     
     final_n_components = MANUAL_K
     # covariance_type='full' allows GMM to find flexible, elliptical clusters.
-    gmm = GaussianMixture(n_components=final_n_components, covariance_type='full', random_state=42)
+    gmm = GaussianMixture(n_components=final_n_components, covariance_type='full', n_init=10, random_state=42)
     
     print(f"\n Training GMM model with n_components={final_n_components} on {len(core_indices)} core accounts...")
     df.loc[core_indices, 'risk_cluster'] = gmm.fit_predict(X_scaled_core)
@@ -107,7 +107,8 @@ def main():
     temp_df_for_corr['total_transaction_count'] = X_all['total_transaction_count']
     
     final_corr_check = temp_df_for_corr.corr().iloc[0, 1]
-    if final_corr_check > 0:
+    pca_needs_flipping = final_corr_check > 0
+    if pca_needs_flipping:
         print("   -> Flipping PCA score to align with risk definition.")
         df['pca_score'] = -df['pca_score']
     
@@ -172,7 +173,12 @@ def main():
         'isolation_forest': iso_forest,
         'gmm': gmm,
         'pca': pca_final,
-        'cluster_risk_mapping': cluster_risk_mapping
+        'cluster_risk_mapping': cluster_risk_mapping,
+        'pca_scaling_params': {
+            'min': pca_min,
+            'max': pca_max,
+            'needs_flipping': pca_needs_flipping
+        }
     }
     
     for name, model in artifacts.items():
