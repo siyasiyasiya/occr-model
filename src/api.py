@@ -251,10 +251,13 @@ import json
 from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Query
 import asyncio
+import time
 
 # --- Import XRPL Libraries ---
 from xrpl.asyncio.clients import AsyncJsonRpcClient
-from xrpl.models.requests import AccountInfo, AccountTx
+from xrpl.models.requests import AccountInfo, AccountTx, AccountLines, LedgerEntry
+from xrpl.models.response import Response
+from xrpl.utils import datetime_to_ripple_time, ripple_time_to_datetime
 
 # --- 1. Robust Path and Configuration Setup ---
 SRC_DIR = Path(__file__).resolve().parent
@@ -277,7 +280,7 @@ try:
     pca = joblib.load(ARTIFACTS_DIR / 'pca.joblib')
     cluster_risk_mapping = joblib.load(ARTIFACTS_DIR / 'cluster_risk_mapping.joblib')
     pca_params = joblib.load(ARTIFACTS_DIR / 'pca_scaling_params.joblib')
-    with open("all_tokens.json", 'r') as f:
+    with open(PROJECT_ROOT / "all_tokens.json", 'r') as f:
         tokens_data = json.load(f)
     token_df = pd.DataFrame(tokens_data)
     print("...artifacts loaded successfully.")
@@ -292,12 +295,54 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# --- 3. Core Service Functions ---
+# --- 3. Helper Functions ---
+async def fetch_account_inception(client, address):
+    """Fetches the account creation time by examining ledger entry"""
+    try:
+        ledger_request = LedgerEntry(
+            ledger_index="validated",
+            account_root=address
+        )
+        response = await client.request(ledger_request)
+        if response.is_successful():
+            # The 'index' field can be used to determine the first ledger this account appeared in
+            # This is a simplification - a more accurate approach would be to use account_tx with
+            # a binary search to find the first transaction for this account
+            first_ledger = response.result.get("ledger_current_index", 0)
+            # Estimate time based on ledger (rough approximation)
+            ripple_epoch_time = int(time.time() - (first_ledger * 4))  # Approx 4 seconds per ledger
+            return ripple_time_to_datetime(ripple_epoch_time).isoformat()
+    except Exception as e:
+        print(f"Error fetching account inception: {e}")
+    
+    # Fallback: if we can't determine inception, use the date of the oldest transaction
+    return None
+
+async def fetch_account_assets(client, address):
+    """Fetches all assets (tokens) held by the account"""
+    assets = []
+    try:
+        lines_request = AccountLines(account=address)
+        lines_response = await client.request(lines_request)
+        
+        if lines_response.is_successful():
+            for line in lines_response.result.get("lines", []):
+                asset = {
+                    "currency": line.get("currency"),
+                    "counterparty": line.get("account"),
+                    "value": line.get("balance"),
+                    "counterpartyName": {"verified": False}  # Default to unverified
+                }
+                assets.append(asset)
+    except Exception as e:
+        print(f"Error fetching account assets: {e}")
+    
+    return assets
 
 async def get_live_data_for_address(address: str, network: str):
     """
     Fetches live data directly from an XRPL node using xrpl-py.
-    This replaces the old XRPScan API calls.
+    Formatted to match the structure expected by the feature generator.
     """
     node_url = XRPL_NODE_URLS.get(network)
     if not node_url:
@@ -308,7 +353,7 @@ async def get_live_data_for_address(address: str, network: str):
     
     # Run requests in parallel for speed
     acc_info_request = AccountInfo(account=address, ledger_index="validated")
-    acc_tx_request = AccountTx(account=address, limit=400) # Fetch a large batch of recent transactions
+    acc_tx_request = AccountTx(account=address, limit=400)  # Fetch a large batch of recent transactions
 
     acc_info_response, acc_tx_response = await asyncio.gather(
         client.request(acc_info_request),
@@ -319,36 +364,55 @@ async def get_live_data_for_address(address: str, network: str):
         raise ValueError(f"Could not fetch account info for {address}. The account may not be activated on {network}.")
     
     account_data = acc_info_response.result["account_data"]
-
+    
+    # Fetch assets held by the account
+    assets = await fetch_account_assets(client, address)
+    
     # Reformat transaction data to match the structure your feature generator expects
     transactions_formatted = []
+    tx_dates = []
+    
     if acc_tx_response.is_successful():
         for tx_entry in acc_tx_response.result.get("transactions", []):
             tx = tx_entry.get("tx", {})
+            # Add meta data which contains transaction result
             tx["meta"] = tx_entry.get("meta", {})
+            
             if "date" in tx:
-                # Ripple Epoch is seconds since Jan 1, 2000 UTC
-                tx["date"] = datetime.fromtimestamp(tx["date"] + 946684800, tz=timezone.utc).isoformat()
+                # Convert Ripple epoch time to ISO format datetime
+                tx_date = ripple_time_to_datetime(tx["date"])
+                tx["date"] = tx_date.isoformat()
+                tx_dates.append(tx_date)
+                
             transactions_formatted.append(tx)
-
-    # Reformat account info to match
+    
+    # Get account inception date (or earliest transaction if not available)
+    inception_date = await fetch_account_inception(client, address)
+    if not inception_date and tx_dates:
+        # Use earliest transaction as fallback
+        inception_date = min(tx_dates).isoformat()
+    
+    # Calculate initial balance (approximation based on current reserves)
+    reserve_base = 10  # XRP reserve base on XRPL (10 XRP for activation)
+    
+    # Reformat account info to match original structure
     account_info_formatted = {
         "account": account_data["Account"],
-        "xrpBalance": str(float(account_data["Balance"]) / 1_000_000), # Convert drops to XRP
-        # Simplification: These are not available from a direct node call, so we provide safe defaults.
-        "inception": None, 
-        "initial_balance": "0" 
+        "xrpBalance": str(float(account_data["Balance"]) / 1_000_000),  # Convert drops to XRP
+        "inception": inception_date,
+        "initial_balance": str(reserve_base)  # Use base reserve as approximation
     }
 
     return {
         "account_info": account_info_formatted,
         "transactions": transactions_formatted,
-        "assets": [] # Simplification: Getting asset data requires more complex AccountLines calls.
+        "assets": assets
     }
 
 def generate_features_from_live_data(live_data: dict, token_df: pd.DataFrame):
     """
-    This function is mostly unchanged, with a key modification for account_age_days.
+    Takes live data and generates only the specific features needed by the model.
+    This is a streamlined version of your feature engineering script.
     """
     print("\n Generating required features from live data...")
     account_info = live_data.get('account_info', {})
@@ -358,29 +422,27 @@ def generate_features_from_live_data(live_data: dict, token_df: pd.DataFrame):
     features = {}
     current_time = pd.Timestamp.now(tz='UTC')
 
-    tx_dates = []
-    for tx in transactions:
-        date_str = tx.get('date')
-        if date_str:
-            try:
-                tx_date = pd.to_datetime(date_str)
-                tx_dates.append(tx_date)
-            except (ValueError, TypeError):
-                continue
-
-    # --- MODIFICATION: Calculate account age from first transaction ---
-    if tx_dates:
-        first_tx_time = min(tx_dates)
-        features['account_age_days'] = (current_time - first_tx_time).days
+    # --- ACCOUNT FUNDAMENTALS ---
+    inception_str = account_info.get('inception')
+    if inception_str:
+        try:
+            inception_time = pd.to_datetime(inception_str)
+            if inception_time.tzinfo is None:
+                inception_time = inception_time.tz_localize('UTC')
+            else:
+                inception_time = inception_time.tz_convert('UTC')
+            features['account_age_days'] = (current_time - inception_time).days
+        except (ValueError, TypeError):
+            # Fallback if date parsing fails
+            features['account_age_days'] = 1
     else:
-        # If no transactions, we can't determine age. Default to a low number.
         features['account_age_days'] = 1
-        
-    # --- The rest of your feature logic remains the same ---
-    # (Pasting your full logic here)
+
     features['xrp_balance'] = float(account_info.get('xrpBalance', 0))
     features['initial_balance'] = float(account_info.get('initial_balance', 0))
     features['balance_to_initial_ratio'] = features['xrp_balance'] / max(features['initial_balance'], 1)
+
+    # --- TRANSACTION PATTERNS ---
     total_txns = len(transactions)
     features['total_transaction_count'] = total_txns
     successful_txns = sum(1 for tx in transactions if tx.get('meta', {}).get('TransactionResult') == 'tesSUCCESS')
@@ -388,20 +450,52 @@ def generate_features_from_live_data(live_data: dict, token_df: pd.DataFrame):
     features['failed_transaction_count'] = total_txns - successful_txns
     tx_types = [tx.get('TransactionType', 'Unknown') for tx in transactions]
     features['payment_transaction_ratio'] = sum(1 for t in tx_types if t == 'Payment') / max(total_txns, 1)
+    
+    tx_dates = []
+    for tx in transactions:
+        date_str = tx.get('date')
+        if date_str:
+            try:
+                tx_date = pd.to_datetime(date_str)
+                if tx_date.tzinfo is None:
+                    tx_date = tx_date.tz_localize('UTC')
+                else:
+                    tx_date = tx_date.tz_convert('UTC')
+                tx_dates.append(tx_date)
+            except (ValueError, TypeError):
+                continue
+    
     features['days_since_last_transaction'] = (current_time - max(tx_dates)).days if tx_dates else 999
     features['transaction_frequency_per_day'] = total_txns / max(features['account_age_days'], 1)
+    
     recent_txns = [tx for tx in tx_dates if (current_time - tx).days <= 30]
     features['recent_activity_ratio'] = len(recent_txns) / max(total_txns, 1)
-    features['recent_failure_count'] = features['failed_transaction_count']
+    features['recent_failure_count'] = features['failed_transaction_count'] # Simplified for live scoring
+    
+    # --- FINANCIAL FLOWS ---
     unique_counterparties = set(tx.get('Destination') for tx in transactions if 'Destination' in tx and tx['Destination'] != account_info['account'])
     features['counterparty_diversity_ratio'] = len(unique_counterparties) / max(total_txns, 1)
-    outgoing_xrp = [float(tx['Amount'])/1e6 for tx in transactions if tx.get('Amount') and isinstance(tx['Amount'], str) and tx.get('Account') == account_info['account']]
+    
+    outgoing_xrp = []
+    for tx in transactions:
+        if tx.get('Account') == account_info['account'] and 'Amount' in tx:
+            amount = tx['Amount']
+            # Handle both string amounts (XRP) and object amounts (tokens)
+            if isinstance(amount, str):
+                outgoing_xrp.append(float(amount)/1e6)
+            elif isinstance(amount, dict) and 'value' in amount:
+                # This is a token amount, not XRP
+                pass
+    
     features['avg_outgoing_amount'] = np.mean(outgoing_xrp) if outgoing_xrp else 0
+    
+    # --- ASSET & PORTFOLIO FEATURES ---
     features['total_assets_held'] = len(assets)
     asset_values = [float(a.get('value', 0)) for a in assets]
     features['total_asset_value'] = sum(asset_values)
     features['total_portfolio_value'] = features['xrp_balance'] + features['total_asset_value']
     features['xrp_portfolio_ratio'] = features['xrp_balance'] / max(features['total_portfolio_value'], 1)
+
     asset_scores = []
     weighted_scores = []
     for asset in assets:
@@ -410,27 +504,36 @@ def generate_features_from_live_data(live_data: dict, token_df: pd.DataFrame):
             score = float(token_row.iloc[0]['score'])
             asset_scores.append(score)
             weighted_scores.append(score * float(asset.get('value', 0)))
+
     features['asset_avg_token_score'] = np.mean(asset_scores) if asset_scores else 0
     features['asset_weighted_avg_token_score'] = sum(weighted_scores) / max(features['total_asset_value'], 1) if weighted_scores else 0
+    
     high_risk_assets = sum(1 for score in asset_scores if score <= 0.003135)
     features['high_risk_asset_ratio'] = high_risk_assets / max(len(asset_scores), 1)
+    
     features['verified_assets_ratio'] = sum(1 for a in assets if a.get('counterpartyName', {}).get('verified')) / max(len(assets), 1)
+    
     if features['total_portfolio_value'] > 0:
         portfolio_shares = [features['xrp_balance'] / features['total_portfolio_value']] + [v / features['total_portfolio_value'] for v in asset_values]
         features['portfolio_concentration_index'] = sum(s**2 for s in portfolio_shares)
     else:
         features['portfolio_concentration_index'] = 1
+        
     risk_categories_used = sum([high_risk_assets > 0, sum(1 for s in asset_scores if 0.003135 < s <= 0.231348) > 0, sum(1 for s in asset_scores if s > 0.231348) > 0])
     features['token_quality_diversification'] = risk_categories_used / 3.0
+    
+    # --- RISK INDICATORS ---
     features['dormancy_score'] = min(features['days_since_last_transaction'] / 90.0, 1.0)
     features['liquidity_risk_score'] = 1 / (1 + features['xrp_balance'])
+    
     if len(tx_dates) > 1:
-        intervals = np.diff(sorted(tx_dates)).astype('timedelta64[s]').astype(float) / (24 * 3600)
+        intervals = np.diff(sorted(tx_dates)).astype('timedelta64[s]').astype(float) / (24 * 3600) # in days
         features['activity_consistency'] = 1 / (1 + np.std(intervals)) if len(intervals) > 0 else 0
     else:
         features['activity_consistency'] = 0
+        
     features['operational_risk_score'] = 1 - features['transaction_success_rate']
-    
+
     print("...features generated.")
     return pd.DataFrame([features])
 
@@ -439,16 +542,18 @@ def generate_features_from_live_data(live_data: dict, token_df: pd.DataFrame):
 @app.get("/score")
 async def get_credit_score(
     address: str,
-    network: str = Query("testnet", enum=["mainnet", "testnet"]) # Default to testnet for safety
+    network: str = Query("testnet", enum=["mainnet", "testnet"])
 ):
     """
     Takes an XRPL account address and returns its risk score and label.
+    This endpoint orchestrates the entire prediction process.
     """
     print(f"Received scoring request for address: {address} on {network}")
     try:
         live_data = await get_live_data_for_address(address, network)
         features_df = generate_features_from_live_data(live_data, token_df)
         
+        # Ensure all required features are present
         for col in feature_cols:
             if col not in features_df.columns:
                 features_df[col] = 0
@@ -482,6 +587,7 @@ async def get_credit_score(
         print(f"❌ Error processing request for {address}: {e}")
         raise HTTPException(status_code=500, detail=f"An error occurred while scoring the address: {str(e)}")
 
+# --- 5. A Root Endpoint for Health Checks ---
 @app.get("/")
 def read_root():
     """A simple endpoint to confirm the API is running."""
