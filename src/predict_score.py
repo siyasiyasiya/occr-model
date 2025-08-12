@@ -8,7 +8,7 @@ import time
 from datetime import datetime
 
 # --- Configuration ---
-ARTIFACTS_DIR = Path('../output/artifacts/')
+ARTIFACTS_DIR = Path('../artifacts/')
 API_BASE_URL = "https://api.xrpscan.com/api/v1"
 # Maintain a safe request rate (approx. 1 per second)
 TARGET_TIME_PER_REQUEST = 1.0
@@ -24,7 +24,7 @@ try:
     cluster_risk_mapping = joblib.load(ARTIFACTS_DIR / 'cluster_risk_mapping.joblib')
     pca_params = joblib.load(ARTIFACTS_DIR / 'pca_scaling_params.joblib')
     # In a production system, this would be loaded once.
-    with open("../data/all_tokens.json", 'r') as f:
+    with open("../all_tokens.json", 'r') as f:
         tokens_data = json.load(f)
     token_df = pd.DataFrame(tokens_data)
     
