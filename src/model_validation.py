@@ -35,18 +35,31 @@ def validate_gmm_model():
     
     # 1. Risk Category Distribution
     is_monotonic, risk_score_stats = validate_risk_distribution(df)
+    plot_risk_score_distribution(df)
     
     # 2. Cluster Confidence Analysis
     avg_confidence, conf_stats = validate_cluster_confidence(df)
-    
+    plot_cluster_confidence(df)
+
     # 3. Feature Correlations
     valid_indicators = validate_feature_correlations(df)
-    
+    plot_feature_correlations(df)
+
     # 4. GMM-Specific Clustering Quality
     bic, aic, ch_score = validate_gmm_quality(df)
-    
+    try:
+        raw_df = pd.read_csv(RAW_DATA_FILE)
+        available_features = [col for col in raw_df.columns if raw_df[col].dtype != 'object']
+        X_imputed = SimpleImputer(strategy='median').fit_transform(raw_df[available_features])
+        X_scaled = StandardScaler().fit_transform(X_imputed)
+        core_indices = df[df['risk_cluster'] != -1].index
+        plot_gmm_fit_metrics(X_scaled[core_indices])
+    except:
+        pass
+
     # 5. Model Consistency
     score_category_corr = validate_model_consistency(df)
+    plot_pca_scatter(df)
     
     # 6. Generate Summary Report
     generate_summary_report(is_monotonic, valid_indicators, score_category_corr, avg_confidence, bic)
@@ -103,6 +116,92 @@ def validate_feature_correlations(df):
                     valid_indicators = False
             print(f"  {indicator:<30}: Expected {expected:<8}, Actual {actual:<8}, Match: {'Yes' if match else 'No'}")
     return valid_indicators
+
+def plot_risk_score_distribution(df):
+    risk_order = ['Minimal Risk', 'Very Low Risk', 'Low Risk', 'Medium Risk', 'High Risk', 'Very High Risk']
+    existing_categories = [cat for cat in risk_order if cat in df['risk_label'].dropna().unique()]
+    
+    plt.figure(figsize=(8, 5))
+    sns.violinplot(
+        data=df,
+        x='risk_label',
+        y='risk_score_pca',
+        order=existing_categories
+    )
+    plt.title("Risk Score Distribution by Risk Label")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "risk_score_distribution.png", dpi=300)
+    plt.close()
+
+
+def plot_cluster_confidence(df):
+    if 'cluster_confidence' in df.columns:
+        risk_order = ['Minimal Risk', 'Very Low Risk', 'Low Risk', 'Medium Risk', 'High Risk', 'Very High Risk']
+        existing_categories = [cat for cat in risk_order if cat in df['risk_label'].dropna().unique()]
+
+        plt.figure(figsize=(8, 5))
+        sns.boxplot(
+            data=df,
+            x='risk_label',
+            y='cluster_confidence',
+            order=existing_categories
+        )
+        plt.title("Cluster Confidence by Risk Label")
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(OUTPUT_DIR / "cluster_confidence.png", dpi=300)
+        plt.close()
+
+
+def plot_feature_correlations(df):
+    exclude_cols = ['risk_cluster', 'risk_score_pca', 'pca_score', 'is_outlier', 'cluster_confidence']
+    feature_cols = [col for col in df.select_dtypes(include=np.number).columns if col not in exclude_cols]
+    corr_matrix = df[feature_cols + ['risk_score_pca']].corr()
+
+    # Take top 15 features most correlated with risk_score_pca
+    top_features = corr_matrix['risk_score_pca'].abs().sort_values(ascending=False).head(15).index
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(corr_matrix.loc[top_features, top_features], annot=True, fmt=".2f", cmap="coolwarm", cbar=True)
+    plt.title("Top Feature Correlations with Risk Score")
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "feature_correlation_heatmap.png", dpi=300)
+    plt.close()
+
+def plot_gmm_fit_metrics(X_scaled_core, max_components=10):
+    """Fit GMM for multiple component counts and plot BIC/AIC curves"""
+    bics, aics, n_components_list = [], [], range(2, max_components+1)
+    for n in n_components_list:
+        gmm = GaussianMixture(n_components=n, covariance_type='full', n_init=5, random_state=42)
+        gmm.fit(X_scaled_core)
+        bics.append(gmm.bic(X_scaled_core))
+        aics.append(gmm.aic(X_scaled_core))
+    
+    plt.figure(figsize=(8, 5))
+    plt.plot(n_components_list, bics, marker='o', label='BIC')
+    plt.plot(n_components_list, aics, marker='o', label='AIC')
+    plt.xlabel("Number of Components")
+    plt.ylabel("Score (Lower is Better)")
+    plt.title("GMM Model Selection Metrics")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "gmm_bic_aic.png", dpi=300)
+    plt.close()
+
+def plot_pca_scatter(df):
+    # If PCA components already exist, use them, else compute from numeric features
+    numeric_df = df.select_dtypes(include=np.number)
+    if 'pca1' not in df.columns or 'pca2' not in df.columns:
+        pca = PCA(n_components=2)
+        pca_result = pca.fit_transform(numeric_df.fillna(0))
+        df['pca1'], df['pca2'] = pca_result[:, 0], pca_result[:, 1]
+    plt.figure(figsize=(8, 6))
+    sns.scatterplot(data=df, x='pca1', y='pca2', hue='risk_label', palette='tab10', alpha=0.7)
+    plt.title("PCA Projection of Accounts by Risk Label")
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "pca_scatter.png", dpi=300)
+    plt.close()
 
 def validate_gmm_quality(df):
     """Calculate GMM-specific clustering metrics like BIC, AIC, and Calinski-Harabasz"""

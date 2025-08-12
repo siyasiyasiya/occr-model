@@ -6,3 +6,4 @@ requests
 matplotlib
 seaborn
 fastapi[all]
+xrpl-py
