@@ -4,17 +4,16 @@ import os
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
-# --- CHANGE 1: Import GaussianMixture ---
 from sklearn.mixture import GaussianMixture
 from sklearn.metrics import silhouette_score
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from sklearn.ensemble import IsolationForest
+import joblib
 
 # --- Central Configuration ---
 INPUT_FILE = '../output/complete_features.csv'
 OUTPUT_DIR = Path('../output/')
-# This is now 'n_components' for GMM. We'll stick with 5 for the core population.
 MANUAL_K = 5
 # ---
 
@@ -80,7 +79,6 @@ def main():
     core_indices = df[df['is_outlier'] == 1].index
     X_scaled_core = X_scaled[core_indices]
     
-    # --- CHANGE 2: Use GaussianMixture instead of KMeans ---
     final_n_components = MANUAL_K
     # covariance_type='full' allows GMM to find flexible, elliptical clusters.
     gmm = GaussianMixture(n_components=final_n_components, covariance_type='full', random_state=42)
@@ -88,7 +86,7 @@ def main():
     print(f"\n Training GMM model with n_components={final_n_components} on {len(core_indices)} core accounts...")
     df.loc[core_indices, 'risk_cluster'] = gmm.fit_predict(X_scaled_core)
     
-    # --- BONUS: Get Cluster Confidence Score ---
+    # --- Get Cluster Confidence Score ---
     core_probabilities = gmm.predict_proba(X_scaled_core)
     df.loc[core_indices, 'cluster_confidence'] = core_probabilities.max(axis=1)
     df['cluster_confidence'].fillna(1.0, inplace=True) # Outliers have 100% confidence
@@ -99,7 +97,7 @@ def main():
 
     # --- 5. Generate Definitive PCA Score for ALL Accounts ---
     print("\n Generating definitive continuous risk score using PCA...")
-    # We use the full scaled data for PCA to get a score for every user
+    # Use the full scaled data for PCA to get a score for every user
     pca_final = PCA(n_components=1)
     full_dataset_pca_transformed = pca_final.fit_transform(X_scaled)
     df['pca_score'] = full_dataset_pca_transformed
@@ -155,6 +153,33 @@ def main():
     
     print("\n ANALYSIS COMPLETE!")
     print(f"   -> Full dataset with profiles & scores saved to '{final_csv_path}'")
+
+    # --- 8. Save Model Artifacts for Deployment ---
+    print("\n Saving model artifacts for future predictions...")
+    
+    artifacts_dir = OUTPUT_DIR / "artifacts"; artifacts_dir.mkdir(exist_ok=True, parents=True)
+
+    # 1. The Scaler: To process new data with the same scaling as the training data.
+    # 2. The Feature List: To ensure the order and number of features is identical.
+    # 3. The Isolation Forest: To identify safe outliers.
+    # 4. The GMM: To cluster the core accounts.
+    # 5. The PCA model: To calculate the final continuous score.
+    # 6. The Cluster-to-Label Mapping: To translate cluster IDs into human-readable labels.
+    
+    artifacts = {
+        'scaler': scaler,
+        'feature_cols': feature_cols,
+        'isolation_forest': iso_forest,
+        'gmm': gmm,
+        'pca': pca_final,
+        'cluster_risk_mapping': cluster_risk_mapping
+    }
+    
+    for name, model in artifacts.items():
+        joblib.dump(model, artifacts_dir / f'{name}.joblib')
+        
+    print(f"   -> All artifacts saved to '{artifacts_dir}'")
+    
 
 if __name__ == "__main__":
     main()
