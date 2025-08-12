@@ -259,8 +259,7 @@ from xrpl.models.requests import AccountInfo, AccountTx
 # --- 1. Robust Path and Configuration Setup ---
 SRC_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SRC_DIR.parent
-ARTIFACTS_DIR = PROJECT_ROOT / "output" / "artifacts"
-DATA_DIR = PROJECT_ROOT / "data"
+ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
 
 # Public node URLs for direct connection
 XRPL_NODE_URLS = {
@@ -278,7 +277,7 @@ try:
     pca = joblib.load(ARTIFACTS_DIR / 'pca.joblib')
     cluster_risk_mapping = joblib.load(ARTIFACTS_DIR / 'cluster_risk_mapping.joblib')
     pca_params = joblib.load(ARTIFACTS_DIR / 'pca_scaling_params.joblib')
-    with open(DATA_DIR / "all_tokens.json", 'r') as f:
+    with open("all_tokens.json", 'r') as f:
         tokens_data = json.load(f)
     token_df = pd.DataFrame(tokens_data)
     print("...artifacts loaded successfully.")
