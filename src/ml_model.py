@@ -4,159 +4,156 @@ import os
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
-from sklearn.cluster import KMeans
+# --- CHANGE 1: Import GaussianMixture ---
+from sklearn.mixture import GaussianMixture
 from sklearn.metrics import silhouette_score
-from sklearn.ensemble import IsolationForest
 import matplotlib.pyplot as plt
-import seaborn as sns
+from sklearn.decomposition import PCA
+from sklearn.ensemble import IsolationForest
 
 # --- Central Configuration ---
-# All key parameters are at the top for easy changes.
 INPUT_FILE = '../output/complete_features.csv'
 OUTPUT_DIR = Path('../output/')
-MANUAL_K = 8  # <-- SET YOUR DESIRED NUMBER OF CLUSTERS HERE (e.g., 4 or 5)
+# This is now 'n_components' for GMM. We'll stick with 5 for the core population.
+MANUAL_K = 5
 # ---
 
-def find_optimal_clusters(X_scaled, max_k=10):
-    """
-    Calculates SSE and Silhouette Scores for a range of k values.
-    """
-    sse = []
-    silhouette_scores = []
-    k_range = range(2, max_k + 1)
-    
-    print("   -> Calculating scores for k=2", end="")
-    for k in k_range:
-        print(f", {k}", end="", flush=True)
-        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-        cluster_labels = kmeans.fit_predict(X_scaled)
-        
-        sse.append(kmeans.inertia_)
-        silhouette_scores.append(silhouette_score(X_scaled, cluster_labels))
-    print("... Done.")
-    
-    optimal_k = k_range[np.argmax(silhouette_scores)]
-    return k_range, sse, silhouette_scores, optimal_k
-
 def main():
-    print("🎯 COMPREHENSIVE ON-CHAIN RISK MODELING PIPELINE")
+    print("COMPREHENSIVE ON-CHAIN RISK MODELING PIPELINE (V7 - GMM)")
     print("=" * 60)
 
     # --- 1. Load Data ---
     if not os.path.exists(INPUT_FILE):
-        print(f"❌ ERROR: Input file not found at '{INPUT_FILE}'")
-        print("   Please ensure the feature engineering script has run and the path is correct.")
+        print(f"ERROR: Input file not found at '{INPUT_FILE}'")
         return
-        
     df = pd.read_csv(INPUT_FILE)
-    print(f"✅ Loaded {df.shape[0]} accounts with {df.shape[1]} features")
+    print(f"Loaded {df.shape[0]} accounts with {df.shape[1]} features")
 
-    # --- 2. Feature Selection ---
-    feature_cols = [
+    # --- 2. Principled Feature Selection ---
+    print("\n Performing principled feature selection...")
+    all_feature_cols = [
         'account_age_days', 'xrp_balance', 'balance_to_initial_ratio', 'total_portfolio_value', 'initial_balance',
         'total_transaction_count', 'transaction_success_rate', 'days_since_last_transaction', 'transaction_frequency_per_day',
         'recent_activity_ratio', 'failed_transaction_count', 'payment_transaction_ratio', 'recent_failure_count',
-        'net_xrp_flow', 'counterparty_diversity_ratio', 'large_transaction_count', 'total_outgoing_xrp',
-        'total_incoming_xrp', 'avg_outgoing_amount', 'total_asset_value', 'asset_weighted_avg_token_score',
+        'counterparty_diversity_ratio', 'avg_outgoing_amount', 'total_asset_value', 'asset_weighted_avg_token_score',
         'high_risk_asset_ratio', 'verified_assets_ratio', 'total_assets_held', 'asset_avg_token_score',
         'portfolio_concentration_index', 'token_quality_diversification', 'xrp_portfolio_ratio', 'dormancy_score',
         'liquidity_risk_score', 'activity_consistency', 'operational_risk_score'
     ]
-    available_features = [col for col in feature_cols if col in df.columns]
-    print(f" Using {len(available_features)} curated features for modeling")
-    X = df[available_features]
+    available_features = [col for col in all_feature_cols if col in df.columns]
+    X_all = df[available_features]
 
-    # --- 3. Preprocessing ---
-    print("\n Preprocessing data...")
+    imputer_fs = SimpleImputer(strategy='median')
+    X_imputed_fs = imputer_fs.fit_transform(X_all)
+    scaler_fs = StandardScaler()
+    X_scaled_fs = scaler_fs.fit_transform(X_imputed_fs)
+    X_all_scaled = pd.DataFrame(X_scaled_fs, columns=X_all.columns)
+
+    correlations = X_all_scaled.corrwith(X_all_scaled['total_transaction_count']).abs().sort_values(ascending=False)
+    correlation_threshold = 0.3
+    strong_features = correlations[correlations > correlation_threshold].index.tolist()
+    key_heuristic_features = ['dormancy_score', 'operational_risk_score', 'liquidity_risk_score', 'high_risk_asset_ratio', 'activity_consistency']
+    for feat in key_heuristic_features:
+        if feat not in strong_features and feat in X_all.columns:
+            strong_features.append(feat)
+
+    feature_cols = list(set(strong_features))
+    print(f"   -> Selected {len(feature_cols)} features with correlation strength > {correlation_threshold}")
+    X = df[feature_cols]
+
+    # --- 3. Preprocessing Final Feature Set ---
+    print("\n Preprocessing final feature set...")
     imputer = SimpleImputer(strategy='median')
     X_imputed = imputer.fit_transform(X)
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_imputed)
 
-    # --- 4. Optimal Cluster Diagnostics ---
-    print("\n Finding optimal clusters for diagnostics...")
-    k_range, sse, silhouette_scores, auto_optimal_k = find_optimal_clusters(X_scaled)
-    print(f"   -> Suggestion from Silhouette Score: k={auto_optimal_k} (score: {max(silhouette_scores):.3f})")
+    # --- 4. Isolate Anomalous Users & Cluster with GMM ---
+    print("\n Identifying anomalous accounts and clustering the core population...")
+    iso_forest = IsolationForest(contamination=0.02, random_state=42)
+    df['is_outlier'] = iso_forest.fit_predict(X_scaled)
+    outlier_count = (df['is_outlier'] == -1).sum()
+    print(f"   -> Identified {outlier_count} anomalous accounts (hyper-power users).")
     
-    # Plot diagnostics
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
-    ax1.plot(k_range, sse, marker='o', color='blue'); ax1.set_title('Elbow Method'); ax1.set_xlabel('Number of Clusters (k)'); ax1.set_ylabel('Sum of Squared Errors'); ax1.grid(True)
-    ax2.plot(k_range, silhouette_scores, marker='s', color='red'); ax2.axvline(x=auto_optimal_k, color='red', linestyle='--', alpha=0.7, label=f'Auto-Optimal k={auto_optimal_k}'); ax2.set_title('Silhouette Scores'); ax2.set_xlabel('Number of Clusters (k)'); ax2.set_ylabel('Silhouette Score'); ax2.grid(True); ax2.legend()
-    plt.tight_layout()
+    df['risk_cluster'] = np.nan
     
-    plots_dir = OUTPUT_DIR / "plots"; plots_dir.mkdir(exist_ok=True, parents=True)
-    plot_path = plots_dir / "cluster_selection_diagnostics.png"
-    plt.savefig(plot_path, dpi=300)
-    # plt.show() # Commented out to prevent script pausing
-    print(f"   -> Diagnostic plot saved to '{plot_path}'")
+    core_indices = df[df['is_outlier'] == 1].index
+    X_scaled_core = X_scaled[core_indices]
     
-    # --- 5. Train Final K-Means Model ---
-    final_k = MANUAL_K
-    print(f"\n Training final K-Means model with interpretable k={final_k}...")
-    kmeans_final = KMeans(n_clusters=final_k, random_state=42, n_init=10)
-    df['risk_cluster'] = kmeans_final.fit_predict(X_scaled)
+    # --- CHANGE 2: Use GaussianMixture instead of KMeans ---
+    final_n_components = MANUAL_K
+    # covariance_type='full' allows GMM to find flexible, elliptical clusters.
+    gmm = GaussianMixture(n_components=final_n_components, covariance_type='full', random_state=42)
+    
+    print(f"\n Training GMM model with n_components={final_n_components} on {len(core_indices)} core accounts...")
+    df.loc[core_indices, 'risk_cluster'] = gmm.fit_predict(X_scaled_core)
+    
+    # --- BONUS: Get Cluster Confidence Score ---
+    core_probabilities = gmm.predict_proba(X_scaled_core)
+    df.loc[core_indices, 'cluster_confidence'] = core_probabilities.max(axis=1)
+    df['cluster_confidence'].fillna(1.0, inplace=True) # Outliers have 100% confidence
+    print("   -> Generated cluster confidence scores.")
+    
+    df.loc[df['is_outlier'] == -1, 'risk_cluster'] = -1
+    print(f"   -> Clustered {len(core_indices)} core accounts into {final_n_components} groups.")
 
-    # --- 6. K-Means Cluster Analysis & Labeling ---
-    print(" Analyzing K-Means cluster characteristics...")
-    cluster_counts = df['risk_cluster'].value_counts().sort_index()
-
-    df['calculated_risk_score'] = (
-        df['dormancy_score'] * 0.25 + df['operational_risk_score'] * 0.25 +
-        df['liquidity_risk_score'] * 0.20 + df['high_risk_asset_ratio'] * 0.15 +
-        (1 - df['activity_consistency']) * 0.15
-    ) * 100
-    cluster_risk_scores = df.groupby('risk_cluster')['calculated_risk_score'].mean()
+    # --- 5. Generate Definitive PCA Score for ALL Accounts ---
+    print("\n Generating definitive continuous risk score using PCA...")
+    # We use the full scaled data for PCA to get a score for every user
+    pca_final = PCA(n_components=1)
+    full_dataset_pca_transformed = pca_final.fit_transform(X_scaled)
+    df['pca_score'] = full_dataset_pca_transformed
     
-    sorted_clusters = cluster_risk_scores.sort_values().index
-    risk_levels = [
-        'Minimal Risk',
-        'Very Low Risk', 
-        'Low Risk',
-        'Low-Medium Risk',
-        'Medium Risk',
-        'Medium-High Risk',
-        'High Risk',
-        'Very High Risk'
-    ]
-    cluster_risk_mapping = {cluster_id: risk_levels[i] for i, cluster_id in enumerate(sorted_clusters)}
+    # Create a temporary dataframe for the correlation check
+    temp_df_for_corr = df[['pca_score']].copy()
+    temp_df_for_corr['total_transaction_count'] = X_all['total_transaction_count']
+    
+    final_corr_check = temp_df_for_corr.corr().iloc[0, 1]
+    if final_corr_check > 0:
+        print("   -> Flipping PCA score to align with risk definition.")
+        df['pca_score'] = -df['pca_score']
+    
+    pca_min = df['pca_score'].min()
+    pca_max = df['pca_score'].max()
+    df['risk_score_pca'] = 100 * (df['pca_score'] - pca_min) / (pca_max - pca_min)
+    print("   -> Continuous PCA risk score (0-100) has been generated.")
+
+    # --- 6. Final Labeling Based on Definitive PCA Score ---
+    print("\n Applying final risk labels based on PCA score...")
+    cluster_pca_scores = df.groupby('risk_cluster')['risk_score_pca'].mean()
+    core_clusters_sorted = cluster_pca_scores[cluster_pca_scores.index != -1].sort_values().index
+    
+    risk_levels = ['Very Low Risk', 'Low Risk', 'Medium Risk', 'High Risk', 'Very High Risk']
+    cluster_risk_mapping = {'-1': 'Minimal Risk'}
+    for i, cluster_id in enumerate(core_clusters_sorted):
+        cluster_risk_mapping[cluster_id] = risk_levels[i]
+            
     df['risk_label'] = df['risk_cluster'].map(cluster_risk_mapping)
-    
-    # --- 7. Train Complementary Isolation Forest Model ---
-    print("\n Training complementary Isolation Forest model for direct risk scores...")
-    iso_forest = IsolationForest(contamination='auto', random_state=42)
-    iso_forest.fit(X_scaled)
+    print("   -> Final risk labels assigned successfully.")
 
-    df['anomaly_score'] = iso_forest.score_samples(X_scaled) * -1
-    df['risk_score_iso_forest'] = ((df['anomaly_score'] - df['anomaly_score'].min()) / (df['anomaly_score'].max() - df['anomaly_score'].min()) * 100)
-
-    # --- 8. Final Results and Outputs ---
-    print(f"\n FINAL RISK PROFILE SUMMARY (k={final_k}):")
+    # --- 7. Final Results and Outputs ---
+    print(f"\n FINAL RISK PROFILE SUMMARY (n_components={final_n_components} core + 1 safe outlier group):")
     print("=" * 60)
-    for cluster_id in sorted_clusters:
-        count = cluster_counts[cluster_id]
-        label = cluster_risk_mapping[cluster_id]
-        score = cluster_risk_scores[cluster_id]
-        print(f"Cluster {cluster_id}: {label:<15} | {count:>3} accounts | Avg. Risk Score: {score:>5.1f}")
+    
+    summary_data = df.groupby('risk_label').agg(
+        account_count=('risk_label', 'count'),
+        avg_pca_score=('risk_score_pca', 'mean')
+    ).reset_index()
+    
+    label_order = ['Minimal Risk', 'Very Low Risk', 'Low Risk', 'Medium Risk', 'High Risk', 'Very High Risk']
+    summary_data['risk_label'] = pd.Categorical(summary_data['risk_label'], categories=label_order, ordered=True)
+    summary_data.sort_values('risk_label', inplace=True)
+
+    for index, row in summary_data.iterrows():
+        print(f"{row['risk_label']:<15} | {row['account_count']:>4} accounts | Avg. PCA Score: {row['avg_pca_score']:>5.1f}")
     
     # Save Outputs
     results_dir = OUTPUT_DIR / "results"; results_dir.mkdir(exist_ok=True, parents=True)
-    
-    cluster_summary = pd.DataFrame({
-        'cluster_id': cluster_risk_scores.index,
-        'risk_score': cluster_risk_scores.values,
-        'risk_label': [cluster_risk_mapping.get(cid) for cid in cluster_risk_scores.index],
-        'account_count': cluster_counts.values
-    }).sort_values('risk_score').reset_index(drop=True)
-
-    cluster_summary.to_csv(results_dir / 'cluster_summary.csv', index=False)
-    
-    # Sort final output by the more granular Isolation Forest score
-    df.sort_values('risk_score_iso_forest', ascending=False, inplace=True)
+    df.sort_values('risk_score_pca', ascending=False, inplace=True)
     final_csv_path = results_dir / 'risk_profiles.csv'
     df.to_csv(final_csv_path, index=False)
     
     print("\n ANALYSIS COMPLETE!")
-    print(f"   -> Summary saved to '{results_dir / 'cluster_summary.csv'}'")
     print(f"   -> Full dataset with profiles & scores saved to '{final_csv_path}'")
 
 if __name__ == "__main__":
