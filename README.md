@@ -4,7 +4,7 @@ A comprehensive machine learning risk assessment system for XRPL (XRP Ledger) ac
 
 ## 🔍 Overview
 
-The OCCR (On-Chain Credit Risk) Model is an advanced ML system that analyzes XRPL account behavior to generate comprehensive credit risk scores. The system processes account history, transaction patterns, asset holdings, and behavioral metrics to assess creditworthiness using sophisticated clustering and anomaly detection techniques.
+The OCCR (On-Chain Credit Risk) Model is a ML system that analyzes XRPL account behavior to generate comprehensive credit risk scores. The system processes account history, transaction patterns, asset holdings, and behavioral metrics to assess creditworthiness using sophisticated clustering and anomaly detection techniques.
 
 ### Key Features
 
