@@ -302,17 +302,17 @@ curl "http://localhost:8000/score?address=rN7n7otQDd6FczFgLdSqtcsAUxDkw6fzRH&net
 
 ### Stage 3: Continuous Risk Scoring (PCA)
 - Principal Component Analysis projects all accounts onto single risk dimension  
-- Scores normalized to 0-100 scale (higher = lower risk)
+- Scores normalized to 0-100 scale (higher = higher risk)
 - Maintains continuous ranking within discrete risk categories
 
 ### Stage 4: Risk Label Assignment
 Pre-defined cluster mappings based on PCA scores:
-- **Minimal Risk**: Anomalous accounts (statistical outliers)
-- **Very Low Risk**: Cluster with highest PCA scores
-- **Low Risk**: Second-highest scoring cluster
-- **Medium Risk**: Middle-scoring cluster  
-- **High Risk**: Second-lowest scoring cluster
-- **Very High Risk**: Lowest-scoring cluster
+- **Very High Risk**: Anomalous accounts (statistical outliers)
+- **High Risk**: Cluster with highest PCA scores
+- **Medium Risk**: Second-highest scoring cluster
+- **Low Risk**: Middle-scoring cluster  
+- **Very Low Risk**: Second-lowest scoring cluster
+- **Minimal Risk**: Lowest-scoring cluster
 
 ## 📡 API Documentation
 
@@ -358,7 +358,7 @@ Health check endpoint.
 import requests
 
 response = requests.get(
-    "http://localhost:8000/score",
+    "https://occr-model-production.up.railway.app/score",
     params={
         "address": "rN7n7otQDd6FczFgLdSqtcsAUxDkw6fzRH",
         "network": "mainnet"
@@ -373,7 +373,7 @@ print(f"Risk Level: {result['risk_label']}")
 #### cURL
 
 ```bash
-curl -X GET "http://localhost:8000/score?address=rN7n7otQDd6FczFgLdSqtcsAUxDkw6fzRH&network=mainnet"
+curl -X GET "https://occr-model-production.up.railway.app/score?address=rN7n7otQDd6FczFgLdSqtcsAUxDkw6fzRH&network=mainnet"
 ```
 
 #### JavaScript
