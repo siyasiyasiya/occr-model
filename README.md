@@ -525,7 +525,12 @@ CMD ["uvicorn", "src.api:app", "--host", "0.0.0.0", "--port", "8000"]
 docker build -t occr-model .
 docker run -p 8000:8000 -v $(pwd)/artifacts:/app/artifacts -v $(pwd):/app/all_tokens.json occr-model
 ```
+### Railway Deployment
 
+This microservice is deployed on Railway at the following
+```bash
+https://occr-model-production.up.railway.app
+```
 ### Production Configuration
 
 #### Environment Variables
